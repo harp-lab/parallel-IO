@@ -18,13 +18,14 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <mpi.h>
-#include "include/zfp.h"
+#include "zfp/include/zfp.h"
 
 static int global_box_size[3];
 static int local_box_size[3];
 static char file_name[512];
 static char write_file_name[512];
-static int image_format;
+static int zfp_comp_flag = -1;
+static float zfp_err_ratio = -1.0;
 static int wavelet_level = -1;
 static int max_wavelet_level;
 static int idx_box_size[3];
@@ -39,12 +40,18 @@ static void MPI_Initial(int argc, char * argv[]);
 static void calculate_per_process_offsets();
 static void read_file_parallel(float * buf, int size);
 static void wavelet_transform(float * buf);
-static void reorganisation(float * buf1,  float * buf2, int flag);
+static void read_DC(float * buf1,  float * buf2);
 static void idx_encoding(float * buf1, float * buf2);
-std::vector<unsigned char> compress_3D_float_prec(float* buf, int dim_x, int dim_y, int dim_z, float param);
+static void read_levels(float * buf1,  float * buf2, int level);
+static void calculate_level_dimension(int* size, int level);
+
+std::vector<unsigned char> compress_3D_float_prec(float* buf, int dim_x, int dim_y, int dim_z, float param, int flag);
 
 
 int main(int argc, char * argv[]) {
+    
+    // MPI environment initialization
+    MPI_Initial(argc, argv);
     
     // Parse arguments
     parse_args(argc, argv);
@@ -55,67 +62,70 @@ int main(int argc, char * argv[]) {
     
     // Check correctness of arguments if users don't require help
     std::string arg = argv[1];
-    if (arg.compare("-h") != 0)
-        check_args(argc, argv);
+    if (arg.compare("-h") == 0)
+        MPI_Abort(MPI_COMM_WORLD, -1);
     
-    MPI_Initial(argc, argv);
+    check_args(argc, argv);
     
     // Calculate offsets per process
     calculate_per_process_offsets();
     
-//    std::cout << rank << ": " << local_box_offset[0] << ", " << local_box_offset[1] << ", " << local_box_offset[2] << "\n";
-    
+    // Mallocate buffer per process, and its size is the local dimension
     float * buf;
     int local_size = local_box_size[0] * local_box_size[1] * local_box_size[2];
     int offset =  local_size * sizeof(float);
-    
     buf = (float *)malloc(offset);
     
+    // Read file in parallel (chunks)
     read_file_parallel(buf, local_size);
-
+    
+    // Wavelet transform (inplace method)
     wavelet_transform(buf);
     
-    for (int i = 0; i < 3; i++)
-    {
-        idx_box_size[i] = local_box_size[i]/pow(2, wavelet_level);
-    }
-    
-    // Reorganize the DC component
+    // Calculate the dimensions of DC component
+    calculate_level_dimension(idx_box_size, wavelet_level);
     int idx_size = idx_box_size[0] * idx_box_size[1] * idx_box_size[2];
-    float * idx_buf;
-    idx_buf = (float *)malloc(idx_size * sizeof(float));
-    reorganisation(idx_buf, buf, 0);
     
-    // IDX coding
-    float * idx_level_buf;
-    idx_level_buf = (float *)malloc(idx_size * sizeof(float));
-    idx_encoding(idx_buf, idx_level_buf);
-    free(idx_buf);
+    // Read DC compoment from buffer
+    float *dc_buf = (float *)malloc(idx_size * sizeof(float));
+    read_DC(buf, dc_buf);
     
-    reorganisation(buf, idx_level_buf, 1);
+    // IDX encoding
+    float *idx_buf = (float *)malloc(idx_size * sizeof(float));
+    idx_encoding(dc_buf, idx_buf);
+    free(dc_buf);
     
-    std::vector<unsigned char> output;
-    output = compress_3D_float_prec(idx_level_buf, idx_box_size[0], idx_box_size[1], idx_box_size[2], 0.1);
+    // zfp compression of idx encoding (DC component)
+    std::vector<unsigned char> output = compress_3D_float_prec(idx_buf, idx_box_size[0], idx_box_size[1], idx_box_size[2], zfp_err_ratio, zfp_comp_flag);
     std::cout << output.size() << "\n";
     
-//    if(rank == 0)
-//    {
-//        for(int i = 0; i < size; i++)
-//        {
-//            std::cout << rank << ": " << output << ": " << idx_level_buf[i] << "\n";
-//        }
-//    }
+    // Read data per level except DC component
+    for (int level = wavelet_level; level > 0; level--)
+    {
+        // Calculate dimension per level
+        int level_size[level];
+        calculate_level_dimension(level_size, level);
+        int size = 7 * level_size[0] * level_size[1] * level_size[2];
+        // Read data per level
+        float *level_buf = (float *)malloc(size * sizeof(float));
+        read_levels(buf, level_buf, level);
+        // zfp compression per level
+        std::vector<unsigned char> output = compress_3D_float_prec(level_buf, level_size[0], level_size[1], level_size[2], zfp_err_ratio, zfp_comp_flag);
+        std::cout << output.size() << "\n";
+    }
     
-    free(idx_level_buf);
+    //    sprintf(write_file_name, "%s", file_name);
+    
+    free(idx_buf);
     free(buf);
     MPI_Finalize();
     return 0;
 }
 
-
+// Parse arguments
 static void parse_args(int argc, char * argv[])
 {
-    char options[] = "hg:l:f:i:w:";
+    char options[] = "hg:l:f:w:z:e:";
     int one_opt = 0;
     
     while((one_opt = getopt(argc, argv, options)) != EOF)
@@ -123,54 +133,60 @@ static void parse_args(int argc, char * argv[])
         switch (one_opt)
         {
             case('h'): // show help
-                std::cout << "Help:\n" << "-g Specify the global box size (e.g., axbxc)\n" << "-l Specify the local box size (e.g., axbxc)\n" << "-f Specify the input file path (e.g., ./example.txt)\n" << "-i Specify the image format (e.g., unit8)\n" << "-w Specify the number of wavelet levels (e.g., 2)" << "-d Specify the number of sub-filling levels (e.g., 2)\n";
+                if (rank == 0)
+                    std::cout << "Help:\n" << "-g Specify the global box size (e.g., axbxc)\n" << "-l Specify the local box size (e.g., axbxc)\n" << "-f Specify the input file path (e.g., ./example.txt)\n" << "-w Specify the number of wavelet levels (e.g., 2)\n" << "-z Specify the zfp compress flag (0 means accuracy, 1 means precision)\n" << "-e Specify the error tolerant rate of zfp compression (range: [0,1])\n\n";
                 break;
                 
             case('g'): //global dimention, e.g., 256x256x256
                 if((sscanf(optarg, "%dx%dx%d", &global_box_size[0], &global_box_size[1], &global_box_size[2]) == EOF))
-                    exit(-1);
+                    MPI_Abort(MPI_COMM_WORLD, -1);
                 break;
                 
             case('l'): //local dimention, e.g., 32x32x32
                 if((sscanf(optarg, "%dx%dx%d", &local_box_size[0], &local_box_size[1], &local_box_size[2]) == EOF))
-                    exit(-1);
+                    MPI_Abort(MPI_COMM_WORLD, -1);
                 break;
                 
             case('f'): // read file name
                 if (sprintf(file_name, "%s", optarg) < 0)
-                    exit(-1);
-                break;
-                
-            case('i'): // image formate, e.g., uint8
-                if((sscanf(optarg, "uint%d", &image_format) == EOF) || image_format > 64)
-                    exit(-1);
+                    MPI_Abort(MPI_COMM_WORLD, -1);
                 break;
                 
             case('w'): // the number of wavelet levels
                 if((sscanf(optarg, "%d", &wavelet_level) == EOF))
-                    exit(-1);
+                    MPI_Abort(MPI_COMM_WORLD, -1);
+                break;
+                
+            case('z'): // 0 means accuracy, 1 means precision
+                if((sscanf(optarg, "%d", &zfp_comp_flag) == EOF) || zfp_comp_flag > 1)
+                    MPI_Abort(MPI_COMM_WORLD, -1);
+                break;
+                
+            case('e'): // the error tolerant rate of zfp compression, range: [0,1]
+                if((sscanf(optarg, "%f", &zfp_err_ratio) == EOF) || zfp_err_ratio > 1.0 || zfp_err_ratio < 0.0)
+                    MPI_Abort(MPI_COMM_WORLD, -1);
                 break;
         }
     }
 }
 
-
+// Check arguments
 static void check_args(int argc, char * argv[])
 {
-    if (global_box_size[0] == 0 || global_box_size[1] == 0 || global_box_size[2] == 0 || local_box_size[0] == 0 || local_box_size[1] == 0 || local_box_size[2] == 0 || file_name[0] == ' ' || wavelet_level == -1)
+    if (global_box_size[0] == 0 || global_box_size[1] == 0 || global_box_size[2] == 0 || local_box_size[0] == 0 || local_box_size[1] == 0 || local_box_size[2] == 0 || file_name[0] == ' ' || wavelet_level == -1 || zfp_comp_flag == -1 || zfp_err_ratio == -1.0)
     {
         std::cout << "Plese using -h to get help\n";
-        exit(-1);
+        MPI_Abort(MPI_COMM_WORLD, -1);
     }
     if (global_box_size[0] < local_box_size[0] || global_box_size[1] < local_box_size[1] || global_box_size[2] < local_box_size[2])
     {
         std::cerr << "ERROR: Global box is smaller than local box in one of the dimensions\n";
-        exit(-1);
+        MPI_Abort(MPI_COMM_WORLD, -1);
     }
     if (wavelet_level > max_wavelet_level)
     {
         std::cerr << "ERROR: Wavelet levels should be smaller than " << max_wavelet_level << "\n";
-        exit(-1);
+        MPI_Abort(MPI_COMM_WORLD, -1);
     }
 }
 
@@ -187,6 +203,7 @@ static void MPI_Initial(int argc, char * argv[])
 }
 
 
+// Calculate the start position of data partition for each process
 static void calculate_per_process_offsets()
 {
     sub_div[0] = (global_box_size[0] / local_box_size[0]);
@@ -198,34 +215,35 @@ static void calculate_per_process_offsets()
     local_box_offset[0] = (slice % sub_div[0]) * local_box_size[0];
 }
 
-
+// Create a subarray for read non contiguous data
 MPI_Datatype create_subarray()
 {
     MPI_Datatype subarray;
-    MPI_Type_create_subarray(3, global_box_size, local_box_size, local_box_offset, MPI_ORDER_C, MPI_FLOAT, &subarray);
+    MPI_Type_create_subarray(3, global_box_size, local_box_size, local_box_offset, MPI_ORDER_FORTRAN, MPI_FLOAT, &subarray);
     MPI_Type_commit(&subarray);
     return subarray;
 }
 
-
+// Read file in parallel
 static void read_file_parallel(float * buf, int size)
 {
     MPI_Datatype subarray = create_subarray();
-
+    
     MPI_File fh;
     MPI_Status status;
-
+    
     MPI_File_open(MPI_COMM_WORLD, file_name, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
     MPI_File_set_view(fh, 0, MPI_FLOAT, subarray, "native", MPI_INFO_NULL);
     MPI_File_read(fh, buf, size, MPI_FLOAT, &status);
     MPI_File_close(&fh);
 }
 
-
+// A wavelet helper
 static void wavelet_helper(float * buf, int step, int ng_step, int flag)
 {
     int si = ng_step; int sj = ng_step; int sk = ng_step;
     
+    // Define the start position based on orientations (x, y, z)
     if (flag == 0)
         sj = step;
     if (flag == 1)
@@ -243,6 +261,7 @@ static void wavelet_helper(float * buf, int step, int ng_step, int flag)
             {
                 int position = k*local_box_size[0]*local_box_size[1] + i*local_box_size[0] + j;
                 
+                // Define the neighbor position based on orientations (x, y, z)
                 if (flag == 0)
                     neighbor = position + ng_step;
                 if (flag == 1)
@@ -257,7 +276,7 @@ static void wavelet_helper(float * buf, int step, int ng_step, int flag)
     }
 }
 
-
+// Wavelet transform (inplace)
 static void wavelet_transform(float * buf)
 {
     for (int level = 1; level <= wavelet_level; level++)
@@ -267,40 +286,63 @@ static void wavelet_transform(float * buf)
         
         // Calculate x-dir
         wavelet_helper(buf, step, ng_step, 0);
-        
         // Calculate y-dir
         wavelet_helper(buf, step, ng_step, 1);
-        
         // Calculate z-dir
         wavelet_helper(buf, step, ng_step, 2);
     }
 }
 
-
-static void reorganisation(float * buf1,  float * buf2, int flag)
+// A reorganisation hepler
+static void reorg_helper(float * buf1,  float * buf2, int step, int *index, int sk, int si, int sj)
 {
-    int step = pow(2, wavelet_level);
-    int index = 0;
-    
-    for (int k = 0; k < local_box_size[2]; k+=step)
+    for (int k = sk; k < local_box_size[2]; k+=step)
     {
-        for (int i = 0; i < local_box_size[0]; i+=step)
+        for (int i = si; i < local_box_size[1]; i+=step)
         {
-            for (int j = 0; j < local_box_size[1]; j+=step)
+            for (int j = sj; j < local_box_size[0]; j+=step)
             {
-                int position = k*local_box_size[0]*local_box_size[1] + i*local_box_size[1] + j;
-                if(flag == 0)
-                    buf1[index] = buf2[position];
-                if(flag == 1)
-                    buf1[position] = buf2[index];
-                index++;
+                int position = k*local_box_size[0]*local_box_size[1] + i*local_box_size[0] + j;
+                buf2[*index] = buf1[position];
+                *index += 1;
             }
         }
     }
 }
 
+// Copy DC component
+static void read_DC(float * buf1,  float * buf2)
+{
+    int step = pow(2, wavelet_level);
+    int index = 0;
+    reorg_helper(buf1, buf2, step, &index, 0, 0, 0);
+}
 
-static void idx_helper(float * buf1, float * buf2, int si, int sj, int sk, int ti, int tj, int tk, int* index)
+
+static void read_levels(float * buf1,  float * buf2, int level)
+{
+    int step = pow(2, level);
+    int n_step[2] = {0, step/2};
+    int index = 0;
+    
+    // Define the start points for HHL, HLL, HLH ...
+    for(int k = 0; k < 2; k++)
+    {
+        for(int i = 0; i < 2; i++)
+        {
+            for(int j = 0; j < 2; j++)
+            {
+                if (j == 0 && i == 0 && k == 0)
+                    continue;
+                else
+                    reorg_helper(buf1, buf2, step, &index, n_step[k], n_step[i], n_step[j]);
+            }
+        }
+    }
+}
+
+// A helper for Idx Encoding
+static void idx_helper(float *buf1, float *buf2, int si, int sj, int sk, int ti, int tj, int tk, int *index)
 {
     for (int k = sk; k < idx_box_size[2]; k+=tk)
     {
@@ -316,8 +358,8 @@ static void idx_helper(float * buf1, float * buf2, int si, int sj, int sk, int t
     }
 }
 
-
-static void idx_encoding(float * buf1, float * buf2)
+// IDX encoding
+static void idx_encoding(float *buf1, float *buf2)
 {
     buf2[0] = buf1[0];
     int index = 1;
@@ -348,14 +390,30 @@ static void idx_encoding(float * buf1, float * buf2)
 }
 
 
+static void calculate_level_dimension(int* size, int level)
+{
+    for (int i = 0; i < 3; i++)
+    {
+        size[i] = local_box_size[i]/pow(2, level);
+    }
+}
+
+// ZFP compression
 std::vector<unsigned char>
-compress_3D_float_prec(float* buf, int dim_x, int dim_y, int dim_z, float param)
+compress_3D_float_prec(float* buf, int dim_x, int dim_y, int dim_z, float param, int flag)
 {
     zfp_type type = zfp_type_float;
     zfp_field* field = zfp_field_3d(buf, type, dim_x, dim_y, dim_z);
     zfp_stream* zfp = zfp_stream_open(nullptr);
-    //zfp_stream_set_accuracy(zfp, param, type);
-    zfp_stream_set_precision(zfp, param);
+    if (flag == 0)
+        zfp_stream_set_accuracy(zfp, param);
+    else if (flag == 1)
+        zfp_stream_set_precision(zfp, param);
+    else
+    {
+        std::cout << "-z should be followed by (0 or 1)\n";
+        MPI_Abort(MPI_COMM_WORLD, -1);
+    }
     size_t max_compressed_bytes = zfp_stream_maximum_size(zfp, field);
     std::vector<unsigned char> output(max_compressed_bytes);
     bitstream* stream = stream_open(&output[0], max_compressed_bytes);
@@ -369,5 +427,4 @@ compress_3D_float_prec(float* buf, int dim_x, int dim_y, int dim_z, float param)
     stream_close(stream);
     return output;
 }
-
 
