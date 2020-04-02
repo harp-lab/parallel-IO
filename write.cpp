@@ -33,19 +33,27 @@ static int local_box_offset[3];
 static int sub_div[3];
 static int rank = 0;
 static int process_count = 1;
+static int out_size = 0;
+
+std::vector<std::string> metadata;
+unsigned char *out_buf;
 
 static void parse_args(int argc, char * argv[]);
 static void check_args(int argc, char * argv[]);
 static void MPI_Initial(int argc, char * argv[]);
 static void calculate_per_process_offsets();
-static void read_file_parallel(float * buf, int size);
-static void wavelet_transform(float * buf);
-static void read_DC(float * buf1,  float * buf2);
-static void idx_encoding(float * buf1, float * buf2);
-static void read_levels(float * buf1,  float * buf2, int level);
+static void read_file_parallel(float *buf, int size);
+static void wavelet_transform(float *buf);
+static void read_DC(float *buf1,  float *buf2);
+static void idx_encoding(float *buf1, float *buf2);
+static void read_levels(float *buf1,  float *buf2, int level);
 static void calculate_level_dimension(int* size, int level);
+static void compressed_subbands(float *buf);
+static void array_to_string(int* array);
+static void write_file_parallel();
 
-std::vector<unsigned char> compress_3D_float_prec(float* buf, int dim_x, int dim_y, int dim_z, float param, int flag);
+std::vector<unsigned char>
+compress_3D_float(float* buf, int dim_x, int dim_y, int dim_z, float param, int flag);
 
 
 int main(int argc, char * argv[]) {
@@ -56,68 +64,71 @@ int main(int argc, char * argv[]) {
     // Parse arguments
     parse_args(argc, argv);
     
-    // The max number of wavelet levels
-    auto min = *std::min_element(local_box_size, local_box_size + 3);
-    max_wavelet_level = log2(min);
-    
     // Check correctness of arguments if users don't require help
     std::string arg = argv[1];
     if (arg.compare("-h") == 0)
         MPI_Abort(MPI_COMM_WORLD, -1);
     
+    // The max number of wavelet levels
+    auto min = *std::min_element(local_box_size, local_box_size + 3);
+    max_wavelet_level = log2(min);
+    
+    // Check arguments
     check_args(argc, argv);
     
+    array_to_string(global_box_size);
+    array_to_string(local_box_size);
+    metadata.push_back(std::to_string(wavelet_level));
+    metadata.push_back(std::to_string(zfp_comp_flag));
+    metadata.push_back(std::to_string(zfp_err_ratio));
+
     // Calculate offsets per process
     calculate_per_process_offsets();
-    
+
     // Mallocate buffer per process, and its size is the local dimension
     float * buf;
     int local_size = local_box_size[0] * local_box_size[1] * local_box_size[2];
     int offset =  local_size * sizeof(float);
     buf = (float *)malloc(offset);
     
+    out_buf = (unsigned char *)malloc(offset);
+
     // Read file in parallel (chunks)
     read_file_parallel(buf, local_size);
-    
+
     // Wavelet transform (inplace method)
     wavelet_transform(buf);
-    
+
     // Calculate the dimensions of DC component
     calculate_level_dimension(idx_box_size, wavelet_level);
     int idx_size = idx_box_size[0] * idx_box_size[1] * idx_box_size[2];
-    
+
     // Read DC compoment from buffer
     float *dc_buf = (float *)malloc(idx_size * sizeof(float));
     read_DC(buf, dc_buf);
-    
+
     // IDX encoding
     float *idx_buf = (float *)malloc(idx_size * sizeof(float));
     idx_encoding(dc_buf, idx_buf);
     free(dc_buf);
     
     // zfp compression of idx encoding (DC component)
-    std::vector<unsigned char> output = compress_3D_float_prec(idx_buf, idx_box_size[0], idx_box_size[1], idx_box_size[2], zfp_err_ratio, zfp_comp_flag);
-    std::cout << output.size() << "\n";
-    
-    // Read data per level except DC component
-    for (int level = wavelet_level; level > 0; level--)
-    {
-        // Calculate dimension per level
-        int level_size[level];
-        calculate_level_dimension(level_size, level);
-        int size = 7 * level_size[0] * level_size[1] * level_size[2];
-        // Read data per level
-        float *level_buf = (float *)malloc(size * sizeof(float));
-        read_levels(buf, level_buf, level);
-        // zfp compression per level
-        std::vector<unsigned char> output = compress_3D_float_prec(level_buf, level_size[0], level_size[1], level_size[2], zfp_err_ratio, zfp_comp_flag);
-        std::cout << output.size() << "\n";
-    }
-    
-    //    sprintf(write_file_name, "%s", file_name);
-    
+    std::vector<unsigned char> output = compress_3D_float(idx_buf, idx_box_size[0], idx_box_size[1], idx_box_size[2], zfp_err_ratio, zfp_comp_flag);
     free(idx_buf);
+    
+    // Combine buffer
+    memcpy(&out_buf[out_size], output.data(), output.size());
+    out_size += output.size();
+    metadata.push_back(std::to_string(output.size()));
+
+    // zfp compression of seven subbands per level
+    compressed_subbands(buf);
     free(buf);
+    
+    // write file in parallel
+    write_file_parallel();
+    
+    free(out_buf);
     MPI_Finalize();
     return 0;
 }
@@ -134,7 +145,7 @@ static void parse_args(int argc, char * argv[])
         {
             case('h'): // show help
                 if (rank == 0)
-                    std::cout << "Help:\n" << "-g Specify the global box size (e.g., axbxc)\n" << "-l Specify the local box size (e.g., axbxc)\n" << "-f Specify the input file path (e.g., ./example.txt)\n" << "-w Specify the number of wavelet levels (e.g., 2)\n" << "-z Specify the zfp compress flag (0 means accuracy, 1 means precision)\n" << "-e Specify the error tolerant rate of zfp compression (range: [0,1])\n\n";
+                std::cout << "Help:\n" << "-g Specify the global box size (e.g., axbxc)\n" << "-l Specify the local box size (e.g., axbxc)\n" << "-f Specify the input file path (e.g., ./example.txt)\n" << "-w Specify the number of wavelet levels (e.g., 2)\n" << "-z Specify the zfp compress flag (0 means accuracy, 1 means precision)\n" << "-e Specify the error tolerant rate of zfp compression (range: [0,1])\n\n";
                 break;
                 
             case('g'): //global dimention, e.g., 256x256x256
@@ -156,14 +167,14 @@ static void parse_args(int argc, char * argv[])
                 if((sscanf(optarg, "%d", &wavelet_level) == EOF))
                     MPI_Abort(MPI_COMM_WORLD, -1);
                 break;
-                
+            
             case('z'): // 0 means accuracy, 1 means precision
                 if((sscanf(optarg, "%d", &zfp_comp_flag) == EOF) || zfp_comp_flag > 1)
                     MPI_Abort(MPI_COMM_WORLD, -1);
                 break;
                 
             case('e'): // the error tolerant rate of zfp compression, range: [0,1]
-                if((sscanf(optarg, "%f", &zfp_err_ratio) == EOF) || zfp_err_ratio > 1.0 || zfp_err_ratio < 0.0)
+                if((sscanf(optarg, "%f", &zfp_err_ratio) == EOF))
                     MPI_Abort(MPI_COMM_WORLD, -1);
                 break;
         }
@@ -228,10 +239,10 @@ MPI_Datatype create_subarray()
 static void read_file_parallel(float * buf, int size)
 {
     MPI_Datatype subarray = create_subarray();
-    
+
     MPI_File fh;
     MPI_Status status;
-    
+
     MPI_File_open(MPI_COMM_WORLD, file_name, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
     MPI_File_set_view(fh, 0, MPI_FLOAT, subarray, "native", MPI_INFO_NULL);
     MPI_File_read(fh, buf, size, MPI_FLOAT, &status);
@@ -318,29 +329,6 @@ static void read_DC(float * buf1,  float * buf2)
     reorg_helper(buf1, buf2, step, &index, 0, 0, 0);
 }
 
-
-static void read_levels(float * buf1,  float * buf2, int level)
-{
-    int step = pow(2, level);
-    int n_step[2] = {0, step/2};
-    int index = 0;
-    
-    // Define the start points for HHL, HLL, HLH ...
-    for(int k = 0; k < 2; k++)
-    {
-        for(int i = 0; i < 2; i++)
-        {
-            for(int j = 0; j < 2; j++)
-            {
-                if (j == 0 && i == 0 && k == 0)
-                    continue;
-                else
-                    reorg_helper(buf1, buf2, step, &index, n_step[k], n_step[i], n_step[j]);
-            }
-        }
-    }
-}
-
 // A helper for Idx Encoding
 static void idx_helper(float *buf1, float *buf2, int si, int sj, int sk, int ti, int tj, int tk, int *index)
 {
@@ -389,7 +377,7 @@ static void idx_encoding(float *buf1, float *buf2)
     }
 }
 
-
+// Calulate the dimension of each level
 static void calculate_level_dimension(int* size, int level)
 {
     for (int i = 0; i < 3; i++)
@@ -400,7 +388,7 @@ static void calculate_level_dimension(int* size, int level)
 
 // ZFP compression
 std::vector<unsigned char>
-compress_3D_float_prec(float* buf, int dim_x, int dim_y, int dim_z, float param, int flag)
+compress_3D_float(float* buf, int dim_x, int dim_y, int dim_z, float param, int flag)
 {
     zfp_type type = zfp_type_float;
     zfp_field* field = zfp_field_3d(buf, type, dim_x, dim_y, dim_z);
@@ -427,4 +415,87 @@ compress_3D_float_prec(float* buf, int dim_x, int dim_y, int dim_z, float param,
     stream_close(stream);
     return output;
 }
+
+// ZFP compression of each subband per level
+static void compressed_subbands(float * buf)
+{
+    int level_size[3];
+    
+    for (int level = wavelet_level; level > 0; level--)
+    {
+        // Calculate dimention per level
+        calculate_level_dimension(level_size, level);
+        int size = level_size[0] * level_size[1] * level_size[2];
+        float* level_buf = (float *)malloc(size * sizeof(float));
+        
+        int step = pow(2, level);
+        int n_step[2] = {0, step/2};
+    
+        // Define the start points for HHL, HLL, HLH ...
+        for(int k = 0; k < 2; k++)
+        {
+            for(int i = 0; i < 2; i++)
+            {
+                for(int j = 0; j < 2; j++)
+                {
+                    int index = 0;
+                    if (j == 0 && i == 0 && k == 0)
+                        continue;
+                    else
+                    {
+                        // Read subbands per level
+                        reorg_helper(buf, level_buf, step, &index, n_step[k], n_step[i], n_step[j]);
+                        // ZFP compression per subbands of each level
+                        std::vector<unsigned char> output = compress_3D_float(level_buf, level_size[0], level_size[1], level_size[2], zfp_err_ratio, zfp_comp_flag);
+                        // Combine buffer
+                        memcpy(&out_buf[out_size], output.data(), output.size());
+                        out_size += output.size();
+                        // Push the compressed size of each subband to metadata
+                        metadata.push_back(std::to_string(output.size()));
+                    }
+                }
+            }
+        }
+        free(level_buf);
+    }
+}
+
+// Convert dimension array to string and push it into metadata
+static void array_to_string(int* array)
+{
+    std::string dimension = "";
+    int size = 3;
+    for(int i = 0; i < size; i++)
+    {
+        if(i < size - 1)
+            dimension += std::to_string(array[i]) + "x";
+        else
+            dimension += std::to_string(array[i]);
+    }
+    metadata.push_back(dimension);
+}
+
+// Write file in parallel (a file per process)
+static void write_file_parallel()
+{
+    std::string name = "./output";
+    sprintf(write_file_name, "%s_%d", name.data(), rank);
+    metadata.push_back(write_file_name);
+    metadata.push_back(std::to_string(process_count));
+    
+    MPI_File fh;
+    MPI_Status status;
+
+    MPI_File_open(MPI_COMM_SELF, write_file_name, MPI_MODE_WRONLY|MPI_MODE_CREATE, MPI_INFO_NULL, &fh);
+    MPI_File_write(fh, out_buf, out_size, MPI_UNSIGNED_CHAR, &status);
+    MPI_File_close(&fh);
+    
+    // Process 0 writes metadata file
+    if (rank == 0)
+    {
+        std::ofstream outfile("./metadata");
+        for (const auto &e: metadata) outfile << e << "\n";
+    }
+}
+
 
