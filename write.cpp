@@ -61,6 +61,8 @@ int main(int argc, char * argv[]) {
     // MPI environment initialization
     MPI_Initial(argc, argv);
     
+    double starttime = MPI_Wtime();
+    
     // Parse arguments
     parse_args(argc, argv);
     
@@ -127,6 +129,11 @@ int main(int argc, char * argv[]) {
     
     // write file in parallel
     write_file_parallel();
+    
+    double endtime = MPI_Wtime() - starttime;
+    MPI_Reduce(&endtime, &starttime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0)
+        std::cout << "Time Taken: " << starttime << "\n";
     
     free(out_buf);
     MPI_Finalize();
