@@ -2,7 +2,6 @@
 //  write.cpp
 //  multiResolution
 //
-//  Created by kokofan on 3/9/20.
 //  Copyright © 2020 koko Fan. All rights reserved.
 //
 
@@ -35,7 +34,7 @@ static int rank = 0;
 static int process_count = 1;
 static int out_size = 0;
 
-std::vector<std::string> metadata;
+std::vector<float> metadata;
 unsigned char *out_buf;
 
 static void parse_args(int argc, char * argv[]);
@@ -78,15 +77,25 @@ int main(int argc, char * argv[]) {
     // Check arguments
     check_args(argc, argv);
     
-    array_to_string(global_box_size);
-    array_to_string(local_box_size);
-    metadata.push_back(std::to_string(wavelet_level));
-    metadata.push_back(std::to_string(zfp_comp_flag));
-    metadata.push_back(std::to_string(zfp_err_ratio));
-
     // Calculate offsets per process
     calculate_per_process_offsets();
-
+    
+    int processes = sub_div[0] * sub_div[1] * sub_div[2];
+    if (rank == 0)
+    {
+        if(process_count != processes)
+        {
+            std::cout << "Error: The number of processes should equal to " << processes << ". (global-dimension/local-dimension)\n";
+            MPI_Abort(MPI_COMM_WORLD, -1);
+        }
+    }
+    
+    array_to_string(global_box_size);
+    array_to_string(local_box_size);
+    metadata.push_back(wavelet_level);
+    metadata.push_back(zfp_comp_flag);
+    metadata.push_back(zfp_err_ratio);
+    
     // Mallocate buffer per process, and its size is the local dimension
     float * buf;
     int local_size = local_box_size[0] * local_box_size[1] * local_box_size[2];
@@ -94,21 +103,21 @@ int main(int argc, char * argv[]) {
     buf = (float *)malloc(offset);
     
     out_buf = (unsigned char *)malloc(offset);
-
+    
     // Read file in parallel (chunks)
     read_file_parallel(buf, local_size);
-
+    
     // Wavelet transform (inplace method)
     wavelet_transform(buf);
-
+    
     // Calculate the dimensions of DC component
     calculate_level_dimension(idx_box_size, wavelet_level);
     int idx_size = idx_box_size[0] * idx_box_size[1] * idx_box_size[2];
-
+    
     // Read DC compoment from buffer
     float *dc_buf = (float *)malloc(idx_size * sizeof(float));
     read_DC(buf, dc_buf);
-
+    
     // IDX encoding
     float *idx_buf = (float *)malloc(idx_size * sizeof(float));
     idx_encoding(dc_buf, idx_buf);
@@ -121,8 +130,8 @@ int main(int argc, char * argv[]) {
     // Combine buffer
     memcpy(&out_buf[out_size], output.data(), output.size());
     out_size += output.size();
-    metadata.push_back(std::to_string(output.size()));
-
+    metadata.push_back(output.size());
+    
     // zfp compression of seven subbands per level
     compressed_subbands(buf);
     free(buf);
@@ -152,7 +161,7 @@ static void parse_args(int argc, char * argv[])
         {
             case('h'): // show help
                 if (rank == 0)
-                std::cout << "Help:\n" << "-g Specify the global box size (e.g., axbxc)\n" << "-l Specify the local box size (e.g., axbxc)\n" << "-f Specify the input file path (e.g., ./example.txt)\n" << "-w Specify the number of wavelet levels (e.g., 2)\n" << "-z Specify the zfp compress flag (0 means accuracy, 1 means precision)\n" << "-e Specify the error tolerant rate of zfp compression (range: [0,1])\n\n";
+                    std::cout << "Help:\n" << "-g Specify the global box size (e.g., axbxc)\n" << "-l Specify the local box size (e.g., axbxc)\n" << "-f Specify the input file path (e.g., ./example.txt)\n" << "-w Specify the number of wavelet levels (e.g., 2)\n" << "-z Specify the zfp compress flag (0 means accuracy, 1 means precision)\n" << "-e Specify the error tolerant rate of zfp compression (range: [0,1])\n\n";
                 break;
                 
             case('g'): //global dimention, e.g., 256x256x256
@@ -174,7 +183,7 @@ static void parse_args(int argc, char * argv[])
                 if((sscanf(optarg, "%d", &wavelet_level) == EOF))
                     MPI_Abort(MPI_COMM_WORLD, -1);
                 break;
-            
+                
             case('z'): // 0 means accuracy, 1 means precision
                 if((sscanf(optarg, "%d", &zfp_comp_flag) == EOF) || zfp_comp_flag > 1)
                     MPI_Abort(MPI_COMM_WORLD, -1);
@@ -246,10 +255,10 @@ MPI_Datatype create_subarray()
 static void read_file_parallel(float * buf, int size)
 {
     MPI_Datatype subarray = create_subarray();
-
+    
     MPI_File fh;
     MPI_Status status;
-
+    
     MPI_File_open(MPI_COMM_WORLD, file_name, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
     MPI_File_set_view(fh, 0, MPI_FLOAT, subarray, "native", MPI_INFO_NULL);
     MPI_File_read(fh, buf, size, MPI_FLOAT, &status);
@@ -437,7 +446,7 @@ static void compressed_subbands(float * buf)
         
         int step = pow(2, level);
         int n_step[2] = {0, step/2};
-    
+        
         // Define the start points for HHL, HLL, HLH ...
         for(int k = 0; k < 2; k++)
         {
@@ -458,7 +467,7 @@ static void compressed_subbands(float * buf)
                         memcpy(&out_buf[out_size], output.data(), output.size());
                         out_size += output.size();
                         // Push the compressed size of each subband to metadata
-                        metadata.push_back(std::to_string(output.size()));
+                        metadata.push_back(output.size());
                     }
                 }
             }
@@ -470,16 +479,12 @@ static void compressed_subbands(float * buf)
 // Convert dimension array to string and push it into metadata
 static void array_to_string(int* array)
 {
-    std::string dimension = "";
     int size = 3;
     for(int i = 0; i < size; i++)
     {
-        if(i < size - 1)
-            dimension += std::to_string(array[i]) + "x";
-        else
-            dimension += std::to_string(array[i]);
+        metadata.push_back(array[i]);
     }
-    metadata.push_back(dimension);
+    
 }
 
 // Write file in parallel (a file per process)
@@ -487,12 +492,11 @@ static void write_file_parallel()
 {
     std::string name = "./output";
     sprintf(write_file_name, "%s_%d", name.data(), rank);
-    metadata.push_back(write_file_name);
-    metadata.push_back(std::to_string(process_count));
+    metadata.push_back(process_count);
     
     MPI_File fh;
     MPI_Status status;
-
+    
     MPI_File_open(MPI_COMM_SELF, write_file_name, MPI_MODE_WRONLY|MPI_MODE_CREATE, MPI_INFO_NULL, &fh);
     MPI_File_write(fh, out_buf, out_size, MPI_UNSIGNED_CHAR, &status);
     MPI_File_close(&fh);
@@ -502,7 +506,9 @@ static void write_file_parallel()
     {
         std::ofstream outfile("./metadata");
         for (const auto &e: metadata) outfile << e << "\n";
+        outfile.close();
     }
 }
+
 
 
