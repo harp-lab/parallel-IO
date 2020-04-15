@@ -48,12 +48,13 @@ static void idx_encoding(float *buf1, float *buf2);
 static void read_levels(float *buf1,  float *buf2, int level);
 static void calculate_level_dimension(int* size, int level);
 static void compressed_subbands(float *buf);
-static void array_to_string(int* array);
+static void compress_idx(float * buf, int idx_size);
+static void push_array(int* array);
 static void write_file_parallel();
+static void write_metadata();
 
 std::vector<unsigned char>
 compress_3D_float(float* buf, int dim_x, int dim_y, int dim_z, float param, int flag);
-
 
 int main(int argc, char * argv[]) {
     
@@ -90,11 +91,12 @@ int main(int argc, char * argv[]) {
         }
     }
     
-    array_to_string(global_box_size);
-    array_to_string(local_box_size);
+    push_array(global_box_size);
+    push_array(local_box_size);
     metadata.push_back(wavelet_level);
     metadata.push_back(zfp_comp_flag);
     metadata.push_back(zfp_err_ratio);
+    metadata.push_back(process_count);
     
     // Mallocate buffer per process, and its size is the local dimension
     float * buf;
@@ -123,18 +125,20 @@ int main(int argc, char * argv[]) {
     idx_encoding(dc_buf, idx_buf);
     free(dc_buf);
     
-    // zfp compression of idx encoding (DC component)
-    std::vector<unsigned char> output = compress_3D_float(idx_buf, idx_box_size[0], idx_box_size[1], idx_box_size[2], zfp_err_ratio, zfp_comp_flag);
+    compress_idx(idx_buf, idx_size);
     free(idx_buf);
-    
-    // Combine buffer
-    memcpy(&out_buf[out_size], output.data(), output.size());
-    out_size += output.size();
-    metadata.push_back(output.size());
     
     // zfp compression of seven subbands per level
     compressed_subbands(buf);
     free(buf);
+    
+    if(rank == 7)
+    {
+        for(int i = 0; i < metadata.size(); i++)
+        {
+            std::cout << metadata[i] << "\n";
+        }
+    }
     
     // write file in parallel
     write_file_parallel();
@@ -463,6 +467,7 @@ static void compressed_subbands(float * buf)
                         reorg_helper(buf, level_buf, step, &index, n_step[k], n_step[i], n_step[j]);
                         // ZFP compression per subbands of each level
                         std::vector<unsigned char> output = compress_3D_float(level_buf, level_size[0], level_size[1], level_size[2], zfp_err_ratio, zfp_comp_flag);
+                        
                         // Combine buffer
                         memcpy(&out_buf[out_size], output.data(), output.size());
                         out_size += output.size();
@@ -476,8 +481,48 @@ static void compressed_subbands(float * buf)
     }
 }
 
+
+static void compress_idx(float * buf, int idx_size)
+{
+    int dim_x = 4; int dim_y = 4; int dim_z = 4;
+    int size = dim_x * dim_y * dim_z;
+    float* init_buf = (float *)malloc(size*sizeof(float));
+    memcpy(init_buf, buf, size*sizeof(float));
+    std::vector<unsigned char> output = compress_3D_float(init_buf, dim_x, dim_y, dim_z, zfp_err_ratio, zfp_comp_flag);
+    free(init_buf);
+    
+    memcpy(&out_buf[out_size], output.data(), output.size());
+    out_size += output.size();
+    metadata.push_back(output.size());
+    
+    int count = size;
+    int i = 0;
+    
+    while (size < idx_size-size+1) {
+        float* level_buf = (float *)malloc(size*sizeof(float));
+        memcpy(level_buf, &buf[count], size*sizeof(float));
+        output = compress_3D_float(level_buf, dim_x, dim_y, dim_z, zfp_err_ratio, zfp_comp_flag);
+        
+        memcpy(&out_buf[out_size], output.data(), output.size());
+        out_size += output.size();
+        metadata.push_back(output.size());
+        
+        count += size;
+        free(level_buf);
+        
+        if (i%3 == 0)
+            dim_x *= 2;
+        else if (i%3 == 1)
+            dim_y *= 2;
+        else
+            dim_z *= 2;
+        size *= 2;
+        i++;
+    }
+}
+
 // Convert dimension array to string and push it into metadata
-static void array_to_string(int* array)
+static void push_array(int* array)
 {
     int size = 3;
     for(int i = 0; i < size; i++)
@@ -492,7 +537,6 @@ static void write_file_parallel()
 {
     std::string name = "./output";
     sprintf(write_file_name, "%s_%d", name.data(), rank);
-    metadata.push_back(process_count);
     
     MPI_File fh;
     MPI_Status status;
@@ -502,13 +546,10 @@ static void write_file_parallel()
     MPI_File_close(&fh);
     
     // Process 0 writes metadata file
-    if (rank == 0)
-    {
-        std::ofstream outfile("./metadata");
-        for (const auto &e: metadata) outfile << e << "\n";
-        outfile.close();
-    }
+    std::string meta_name = "./metadata";
+    char metadata_file[512];
+    sprintf(metadata_file, "%s_%d", meta_name.data(), rank);
+    std::ofstream outfile(metadata_file);
+    for (const auto &e: metadata) outfile << e << "\n";
+    outfile.close();
 }
-
-
-
