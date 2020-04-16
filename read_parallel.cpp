@@ -11,6 +11,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <tuple>
 #include <unistd.h>
 #include <math.h>
 #include <mpi.h>
@@ -22,45 +23,58 @@ static int wavelet_level = -1;
 static int zfp_comp_flag = -1;
 static float zfp_err_ratio = -1.0;
 static int write_processes_num = -1;
+static int dc_box_size[3];
+//static int num_blocks;
 static int rank = 0;
 static int process_count = 1;
 static int idx_level = -1;
 static int require_level = -1;
 static int total_level = -1;
 static int dc_size = 1;
+static int buf_num;
 
 std::vector<float> metadata;
-std::vector<int> compress_size;
 std::vector<std::string> file_names;
 
 unsigned char *out_buf;
 
 static void MPI_Initial(int argc, char * argv[]);
-static void read_metadata();
+static void read_metadata(int num);
 static void parse_metadata();
 static void parse_args(int argc, char * argv[]);
 static void check_args(int argc, char * argv[]);
 static int calculate_buffer_offset();
-static void read_file_decompress(float* buf);
+//static void read_file_decompress(float* buf);
+static void read_file_decompress(float* buf, int num);
+static void idx_decoding(float *buf1, float *buf2, int level);
+//static void reorganisation(float *buf1, float *buf2, int level);
+static void wavelet_recover(float * buf);
+
 
 bool decompress_3D_float(const char* input, size_t bytes, int dim_x, int dim_y, int dim_z, float param, char** output, int flag);
 
 int main(int argc, char * argv[])
 {
-    read_metadata();
+    read_metadata(0);
     parse_metadata();
     
     // MPI environment initialization
     MPI_Initial(argc, argv);
     double starttime = MPI_Wtime();
     
+    
     for(int i = 0; i < 3; i++)
     {
-        dc_size = dc_size * (local_box_size[i]/pow(2, wavelet_level));
+        dc_box_size[i] = local_box_size[i]/pow(2, wavelet_level);
     }
+    dc_size = dc_box_size[0] * dc_box_size[1] * dc_box_size[2];
     
-    // First three levels of idx can be treated as first level
-    idx_level = log2(dc_size) + 1 - 2;
+    int idx_level_size = 4*4*4;
+    idx_level = 1;
+    while (idx_level_size < dc_size) {
+        idx_level_size *= 2;
+        idx_level++;
+    }
     total_level = wavelet_level + idx_level;
     
     // Prase arguments
@@ -73,13 +87,41 @@ int main(int argc, char * argv[])
     check_args(argc, argv);
     
     int offset = calculate_buffer_offset();
-
+    
     int divis = write_processes_num/process_count;
     int rem = write_processes_num%process_count;
-    int buf_num = (rank < rem)?(divis+1):divis;
+    buf_num = (rank < rem)?(divis+1):divis;
     
-    float * buf = (float *)malloc(offset*buf_num);
-    read_file_decompress(buf);
+    int num = rank;
+    int diff = total_level - require_level;
+    while (num < write_processes_num)
+    {
+        float *buf = (float *)malloc(offset);
+        read_file_decompress(buf, num);
+        
+        float* idx_buf = (float *)calloc(dc_size, sizeof(float));
+        idx_decoding(buf, idx_buf, diff);
+        
+        if(diff > idx_level)
+        {
+            memcpy(buf, idx_buf, dc_size*sizeof(float));
+        }
+        
+        wavelet_recover(buf);
+        
+        if(num == 0)
+        {
+            for(int i = 0; i < offset/sizeof(float); i++)
+            {
+                std::cout << buf[i] << "\n";
+            }
+        }
+        
+        
+        free(idx_buf);
+        num += process_count;
+        free(buf);
+    }
     
     MPI_Finalize();
     return 0;
@@ -98,9 +140,13 @@ static void MPI_Initial(int argc, char * argv[])
 }
 
 // Read metadata file
-static void read_metadata()
+static void read_metadata(int num)
 {
-    std::ifstream infile("./metadata");
+    std::string meta_name = "./metadata";
+    char metadata_file[512];
+    sprintf(metadata_file, "%s_%d", meta_name.data(), num);
+    
+    std::ifstream infile(metadata_file);
     float a;
     while (infile >> a)
     {
@@ -121,10 +167,7 @@ static void parse_metadata()
         wavelet_level = metadata[6];
         zfp_comp_flag = metadata[7];
         zfp_err_ratio = metadata[8];
-        int num_blocks = wavelet_level * 7 + 1;
-        for(int i = 9; i < num_blocks+9; i++)
-            compress_size.push_back(int(metadata[i]));
-        write_processes_num = metadata[num_blocks+9];
+        write_processes_num = metadata[9];
     }
     else
     {
@@ -153,7 +196,7 @@ static void parse_args(int argc, char * argv[])
                     std::cout << "Required level should be in range [0, " << total_level << "]\n";
                     MPI_Abort(MPI_COMM_WORLD, -1);
                 }
-                 break;
+                break;
         }
     }
 }
@@ -168,93 +211,27 @@ static void check_args(int argc, char * argv[])
     }
 }
 
+
 static int calculate_buffer_offset()
 {
     int offset = sizeof(float);
-    if (require_level < wavelet_level)
+    if (require_level <= wavelet_level)
     {
         for(int i = 0; i < 3; i++)
         {
-            offset = offset * (local_box_size[i]/pow(2, require_level));
+            offset *= (local_box_size[i]/pow(2, require_level));
         }
+    }
+    else if (require_level == total_level)
+    {
+        offset *= 64;
     }
     else
     {
-        offset = offset * dc_size;
+        int dif = require_level-wavelet_level;
+        offset *= 2*dc_size/(pow(2, dif));
     }
     return offset;
-}
-
-
-static void calculate_level_dimension(int* size, int level)
-{
-    for (int i = 0; i < 3; i++)
-    {
-        size[i] = local_box_size[i]/pow(2, level);
-    }
-}
-
-
-static void read_file_decompress(float* buf)
-{
-    int num = rank;
-    int ind = (wavelet_level - require_level > 0)? (wavelet_level - require_level):0;
-    int start_point = 0;
-    
-    int size = 0;
-    for(int i = 0; i < ind*7+1; i++)
-    {
-        size += compress_size[i];
-    }
-    
-    std::string name = "./output";
-    while (num < write_processes_num)
-    {
-        // Get file name
-        char file_name[512];
-        sprintf(file_name, "%s_%d", name.data(), num);
-        
-        // Read file
-        unsigned char* tmp_buf = (unsigned char*)malloc(size);
-        MPI_File fh;
-        MPI_Status status;
-        MPI_File_open(MPI_COMM_SELF, file_name, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
-        MPI_File_read(fh, tmp_buf, size, MPI_UNSIGNED_CHAR, &status);
-        MPI_File_close(&fh);
-        
-        // Initial parameters
-        int out_size = 0;
-        int level = wavelet_level;
-        int level_size[3];
-        calculate_level_dimension(level_size, level);
-        int size = level_size[0] * level_size[1] * level_size[2];
-
-        // ZFP decompress each sub-bands
-        for(int i = 0; i < ind*7+1; i++)
-        {
-            // Calculate dimension per level
-            if (i > 1 && (i-1)%7 == 0)
-            {
-                level--;
-                calculate_level_dimension(level_size, level);
-                size = level_size[0] * level_size[1] * level_size[2];
-            }
-            
-            // ZFP decompression
-            float* decompress_buf = (float *)malloc(size * sizeof(float));
-            decompress_3D_float((const char*)&tmp_buf[out_size], compress_size[i], level_size[0], level_size[1], level_size[2], zfp_err_ratio, (char**)&decompress_buf, zfp_comp_flag);
-            
-            // Combine each decompression buf
-            memcpy(&buf[start_point], decompress_buf, size*sizeof(float));
-
-            start_point += size;
-            free(decompress_buf);
-            out_size += compress_size[i];
-        }
-        
-        free(tmp_buf);
-        num += process_count;
-    }
 }
 
 
@@ -286,4 +263,282 @@ bool decompress_3D_float(const char* input, size_t bytes, int dim_x, int dim_y, 
     zfp_stream_close(zfp);
     stream_close(stream);
     return true;
+}
+
+
+static void calculate_level_dimension(int* size, int level)
+{
+    for (int i = 0; i < 3; i++)
+    {
+        size[i] = local_box_size[i]/pow(2, level);
+    }
+}
+
+static void calculate_idx_level_dimension(int* size, int diff)
+{
+    size[0] = 4; size[1] = 4; size[2] = 4;
+    
+    for(int i = 1; i < diff; i++)
+    {
+        if (i%3 == 1)
+            size[0] *= 2;
+        else if (i%3 == 2)
+            size[1] *= 2;
+        else
+            size[2] *= 2;
+    }
+}
+
+
+std::vector<int> parse_compress_size()
+{
+    std::vector<int> compress_size;
+    int num_blocks = wavelet_level*7 + idx_level;
+    for(int i = 10; i < num_blocks+10; i++)
+        compress_size.push_back(int(metadata[i]));
+    return compress_size;
+}
+
+
+std::tuple<int, int> idx_decompress(float* buf,  unsigned char* tmp_buf, std::vector<int> compress_size, int max_i)
+{
+    int level_size = 0;
+    int level_dimen[3];
+    int start_point = 0;
+    int out_size = 0;
+    
+    for(int i = 0; i < max_i; i++)
+    {
+        calculate_idx_level_dimension(level_dimen, i);
+        level_size = level_dimen[0] * level_dimen[1] * level_dimen[2];
+        
+        float* decompress_buf = (float *)malloc(level_size * sizeof(float));
+        decompress_3D_float((const char*)&tmp_buf[out_size], compress_size[i], level_dimen[0], level_dimen[1], level_dimen[2], zfp_err_ratio, (char**)&decompress_buf, zfp_comp_flag);
+        
+        memcpy(&buf[start_point], decompress_buf, level_size*sizeof(float));
+        start_point += level_size;
+        out_size += compress_size[i];
+        free(decompress_buf);
+    }
+    
+    return std::make_tuple(start_point, out_size);
+}
+
+
+static void wavelet_decompress(float* buf, unsigned char* tmp_buf, std::vector<int> compress_size, int start_point, int out_size)
+{
+    int ind = (wavelet_level - require_level > 0)? (wavelet_level - require_level):0;
+    int level = wavelet_level;
+    int level_dimen[3];
+    
+    for(int i = idx_level; i < ind*7+idx_level; i++)
+    {
+        calculate_level_dimension(level_dimen, level);
+        int level_size = level_dimen[0] * level_dimen[1] * level_dimen[2];
+        
+        if (i > idx_level && (i-idx_level)%7 == 0)
+        {
+            level--;
+            calculate_level_dimension(level_dimen, level);
+            level_size = level_dimen[0] * level_dimen[1] * level_dimen[2];
+        }
+        
+        float* decompress_buf = (float *)malloc(level_size * sizeof(float));
+        decompress_3D_float((const char*)&tmp_buf[out_size], compress_size[i], level_dimen[0], level_dimen[1], level_dimen[2], zfp_err_ratio, (char**)&decompress_buf, zfp_comp_flag);
+        
+        memcpy(&buf[start_point], decompress_buf, level_size*sizeof(float));
+        start_point += level_size;
+        out_size += compress_size[i];
+        free(decompress_buf);
+    }
+}
+
+
+static void read_file_decompress(float* buf, int num)
+{
+    int ind = (wavelet_level - require_level > 0)? (wavelet_level - require_level):0;
+    int level_dimen[3];
+    int diff = 0;
+    if(require_level > wavelet_level)
+    {
+        diff = total_level - require_level;
+        calculate_idx_level_dimension(level_dimen, diff);
+    }
+    
+    std::string name = "./output";
+    read_metadata(num);
+    std::vector<int> compress_size = parse_compress_size();
+    
+    // Get file name
+    char file_name[512];
+    sprintf(file_name, "%s_%d", name.data(), num);
+    
+    int size = 0;
+    if (require_level > wavelet_level)
+    {
+        for(int i = 0; i < diff+1; i++)
+            size += compress_size[i];
+    }
+    else
+    {
+        for(int i = 0; i < ind*7+idx_level; i++)
+            size += compress_size[i];
+    }
+    
+    unsigned char* tmp_buf = (unsigned char*)malloc(size);
+    
+    MPI_File fh;
+    MPI_Status status;
+    MPI_File_open(MPI_COMM_SELF, file_name, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
+    MPI_File_read(fh, tmp_buf, size, MPI_UNSIGNED_CHAR, &status);
+    MPI_File_close(&fh);
+    
+    if (require_level > wavelet_level)
+    {
+        idx_decompress(buf, tmp_buf, compress_size, diff+1);
+    }
+    else
+    {
+        int start_point; int out_size;
+        std::tie(start_point, out_size)  = idx_decompress(buf, tmp_buf, compress_size, idx_level);
+        wavelet_decompress(buf, tmp_buf, compress_size, start_point, out_size);
+        
+    }
+    free(tmp_buf);
+}
+
+
+static void idx_helper(float *buf1, float *buf2, int si, int sj, int sk, int ti, int tj, int tk, int *index)
+{
+    for (int k = sk; k < dc_box_size[2]; k+=tk)
+    {
+        for (int i = si; i < dc_box_size[1]; i+=ti)
+        {
+            for (int j = sj; j < dc_box_size[0]; j+=tj)
+            {
+                int position = k*dc_box_size[0]*dc_box_size[1] + i*dc_box_size[0] + j;
+                buf2[position] = buf1[*index];
+                *index += 1;
+            }
+        }
+    }
+}
+
+
+static void idx_decoding(float *buf1, float *buf2, int level)
+{
+    level = (level < idx_level)? level: (idx_level-1);
+    
+    buf2[0] = buf1[0];
+    int index = 1;
+    
+    int si, sj, sk;
+    int level_dimen[3];
+    
+    calculate_idx_level_dimension(level_dimen, level);
+    
+    int ti = dc_box_size[0];
+    int tj = dc_box_size[1];
+    int tk = dc_box_size[2];
+    
+    int level_size = 64;
+    for(int l = 0; l < level; l++)
+    {
+        level_size *= 2;
+    }
+    int count = log2(level_size);
+    
+    int i = 0;
+    while ( i < count)
+    {
+        sj = tj/2; si = 0; sk = 0;
+        idx_helper(buf1, buf2, si, sj, sk, ti, tj, tk, &index);
+        tj = tj/2;
+        i++;
+        if( i < count)
+        {
+            si = ti/2; sj = 0; sk = 0;
+            idx_helper(buf1, buf2, si, sj, sk, ti, tj, tk, &index);
+            ti = ti/2;
+            i++;
+        }
+        if( i < count)
+        {
+            sk = tk/2; si = 0; sj = 0;
+            idx_helper(buf1, buf2, si, sj, sk, ti, tj, tk, &index);
+            tk = tk/2;
+            i++;
+        }
+    }
+}
+
+
+static void wavelet_recover(float* buf)
+{
+    int level_dimen[3];
+    for(int level = wavelet_level; level > require_level; level--)
+    {
+        
+        calculate_level_dimension(level_dimen, level);
+        int level_size = level_dimen[0] * level_dimen[1] * level_dimen[2];
+        
+        // z
+        float* dc_buf = (float *)malloc(4*level_size*sizeof(float));
+        float* sub_buf = (float *)malloc(4*level_size*sizeof(float));
+        memcpy(dc_buf, buf, 4*level_size*sizeof(float));
+        memcpy(sub_buf, &buf[4*level_size], 4*level_size*sizeof(float));
+        
+        for(int i = 0; i < 4*level_size; i++)
+        {
+            buf[i] = dc_buf[i] + sub_buf[i];
+            buf[4*level_size+i] = dc_buf[i] - sub_buf[i];
+        }
+        
+        // y
+        int start = 0;
+        for(int i = 0; i < 8; i+=4)
+        {
+            memcpy(&dc_buf[start], &buf[i*level_size], 2*level_size*sizeof(float));
+            memcpy(&sub_buf[start], &buf[(i+2)*level_size], 2*level_size*sizeof(float));
+            start += 2*level_size;
+        }
+        
+        for(int i = 0; i < 4*level_size; i++)
+        {
+            if(i < 2*level_size)
+            {
+                buf[i] = dc_buf[i] + sub_buf[i];
+                buf[2*level_size+i] = dc_buf[i] - sub_buf[i];
+            }
+            else
+            {
+                buf[2*level_size+i] = dc_buf[i] + sub_buf[i];
+                buf[4*level_size+i] = dc_buf[i] - sub_buf[i];
+            }
+        }
+        
+        // x
+        start = 0;
+        for(int i = 0; i < 8; i+=2)
+        {
+            memcpy(&dc_buf[start], &buf[i*level_size], level_size*sizeof(float));
+            memcpy(&sub_buf[start], &buf[(i+1)*level_size], level_size*sizeof(float));
+            start += level_size;
+        }
+        
+        
+        int k = 0;
+        for(int i = 0; i < 4; i++)
+        {
+            for(int j = 0; j < level_size; j++)
+            {
+                buf[k*level_size+j] = dc_buf[i*level_size+j] + sub_buf[i*level_size+j];
+                buf[(k+1)*level_size+j] = dc_buf[i*level_size+j] - sub_buf[i*level_size+j];
+            }
+            k+=2;
+        }
+        
+        free(dc_buf);
+        free(sub_buf);
+    }
 }
