@@ -24,7 +24,8 @@ static int zfp_comp_flag = -1;
 static float zfp_err_ratio = -1.0;
 static int write_processes_num = -1;
 static int dc_box_size[3];
-//static int num_blocks;
+static int sub_div[3];
+static int local_box_offset[3];
 static int rank = 0;
 static int process_count = 1;
 static int idx_level = -1;
@@ -32,6 +33,7 @@ static int require_level = -1;
 static int total_level = -1;
 static int dc_size = 1;
 static int buf_num;
+static char file_name[512];
 
 std::vector<float> metadata;
 std::vector<std::string> file_names;
@@ -44,14 +46,13 @@ static void parse_metadata();
 static void parse_args(int argc, char * argv[]);
 static void check_args(int argc, char * argv[]);
 static int calculate_buffer_offset();
-//static void read_file_decompress(float* buf);
 static void read_file_decompress(float* buf, int num);
 static void idx_decoding(float *buf1, float *buf2, int level);
-//static void reorganisation(float *buf1, float *buf2, int level);
 static void wavelet_recover(float * buf);
-
+static void calculate_per_process_offsets();
 
 bool decompress_3D_float(const char* input, size_t bytes, int dim_x, int dim_y, int dim_z, float param, char** output, int flag);
+
 
 int main(int argc, char * argv[])
 {
@@ -105,18 +106,10 @@ int main(int argc, char * argv[])
         if(diff > idx_level)
         {
             memcpy(buf, idx_buf, dc_size*sizeof(float));
+            wavelet_recover(buf);
         }
         
-        wavelet_recover(buf);
-        
-        if(num == 0)
-        {
-            for(int i = 0; i < offset/sizeof(float); i++)
-            {
-                std::cout << buf[i] << "\n";
-            }
-        }
-        
+        //        calculate_per_process_offsets();
         
         free(idx_buf);
         num += process_count;
@@ -179,7 +172,7 @@ static void parse_metadata()
 
 static void parse_args(int argc, char * argv[])
 {
-    char options[] = "hl:";
+    char options[] = "hl:f:";
     int one_opt = 0;
     
     while((one_opt = getopt(argc, argv, options)) != EOF)
@@ -196,6 +189,10 @@ static void parse_args(int argc, char * argv[])
                     std::cout << "Required level should be in range [0, " << total_level << "]\n";
                     MPI_Abort(MPI_COMM_WORLD, -1);
                 }
+                break;
+            case('f'): // read file name
+                if (sprintf(file_name, "%s", optarg) < 0)
+                    MPI_Abort(MPI_COMM_WORLD, -1);
                 break;
         }
     }
@@ -478,7 +475,6 @@ static void wavelet_recover(float* buf)
     int level_dimen[3];
     for(int level = wavelet_level; level > require_level; level--)
     {
-        
         calculate_level_dimension(level_dimen, level);
         int level_size = level_dimen[0] * level_dimen[1] * level_dimen[2];
         
@@ -488,10 +484,23 @@ static void wavelet_recover(float* buf)
         memcpy(dc_buf, buf, 4*level_size*sizeof(float));
         memcpy(sub_buf, &buf[4*level_size], 4*level_size*sizeof(float));
         
-        for(int i = 0; i < 4*level_size; i++)
+        float* tmp_buf = (float *)malloc(2*level_size*sizeof(float));
+        for(int s = 0; s < 4; s++)
         {
-            buf[i] = dc_buf[i] + sub_buf[i];
-            buf[4*level_size+i] = dc_buf[i] - sub_buf[i];
+            for(int k = 0; k < level_dimen[2]; k++)
+            {
+                int page = level_dimen[0] * level_dimen[1];
+                for(int i = 0; i < page; i++)
+                {
+                    int position = s*level_size + k*page + i;
+                    int index = 2*k*page + i;
+                    int neighbor = index + page;
+                    tmp_buf[index] = dc_buf[position] + sub_buf[position];
+                    tmp_buf[neighbor] = dc_buf[position] - sub_buf[position];
+                }
+            }
+            memcpy(&buf[s*level_size], &tmp_buf[0], level_size*sizeof(float));
+            memcpy(&buf[(s+4)*level_size], &tmp_buf[level_size], level_size*sizeof(float));
         }
         
         // y
@@ -503,17 +512,32 @@ static void wavelet_recover(float* buf)
             start += 2*level_size;
         }
         
-        for(int i = 0; i < 4*level_size; i++)
+        
+        for(int s = 0; s < 4; s++)
         {
-            if(i < 2*level_size)
+            for(int k = 0; k < level_dimen[2]; k++)
             {
-                buf[i] = dc_buf[i] + sub_buf[i];
-                buf[2*level_size+i] = dc_buf[i] - sub_buf[i];
+                for(int i = 0; i < level_dimen[1]; i++)
+                {
+                    for(int j = 0; j < level_dimen[0]; j++)
+                    {
+                        int position = s*level_size + k*level_dimen[1]*level_dimen[0] + i*level_dimen[0] + j;
+                        int index = 2*k*level_dimen[1]*level_dimen[0] + 2*i*level_dimen[0] + j;
+                        int neighbor = index + level_dimen[0];
+                        tmp_buf[index] = dc_buf[position] + sub_buf[position];
+                        tmp_buf[neighbor] = dc_buf[position] - sub_buf[position];
+                    }
+                }
+            }
+            if(s < 2)
+            {
+                memcpy(&buf[s*level_size], &tmp_buf[0], level_size*sizeof(float));
+                memcpy(&buf[(s+2)*level_size], &tmp_buf[level_size], level_size*sizeof(float));
             }
             else
             {
-                buf[2*level_size+i] = dc_buf[i] + sub_buf[i];
-                buf[4*level_size+i] = dc_buf[i] - sub_buf[i];
+                memcpy(&buf[(s+2)*level_size], &tmp_buf[0], level_size*sizeof(float));
+                memcpy(&buf[(s+4)*level_size], &tmp_buf[level_size], level_size*sizeof(float));
             }
         }
         
@@ -526,19 +550,63 @@ static void wavelet_recover(float* buf)
             start += level_size;
         }
         
-        
-        int k = 0;
-        for(int i = 0; i < 4; i++)
+        for(int s = 0; s < 4; s++)
         {
-            for(int j = 0; j < level_size; j++)
+            for(int k = 0; k < level_dimen[2]; k++)
             {
-                buf[k*level_size+j] = dc_buf[i*level_size+j] + sub_buf[i*level_size+j];
-                buf[(k+1)*level_size+j] = dc_buf[i*level_size+j] - sub_buf[i*level_size+j];
+                for(int i = 0; i < level_dimen[1]; i++)
+                {
+                    for(int j = 0; j < level_dimen[0]; j++)
+                    {
+                        int position = s*level_size + k*level_dimen[1]*level_dimen[0] + i*level_dimen[0] + j;
+                        int index = 2*k*level_dimen[1]*level_dimen[0] + 2*i*level_dimen[0] + 2*j;
+                        int neighbor = index + 1;
+                        tmp_buf[index] = dc_buf[position] + sub_buf[position];
+                        tmp_buf[neighbor] = dc_buf[position] - sub_buf[position];
+                    }
+                }
             }
-            k+=2;
+            memcpy(&buf[2*s*level_size], &tmp_buf[0], level_size*sizeof(float));
+            memcpy(&buf[(2*s+1)*level_size], &tmp_buf[level_size], level_size*sizeof(float));
         }
-        
+        free(tmp_buf);
         free(dc_buf);
         free(sub_buf);
     }
 }
+
+// Calculate the start position of data partition for each process
+static void calculate_per_process_offsets()
+{
+    sub_div[0] = (global_box_size[0] / local_box_size[0]);
+    sub_div[1] = (global_box_size[1] / local_box_size[1]);
+    sub_div[2] = (global_box_size[2] / local_box_size[2]);
+    local_box_offset[2] = (rank / (sub_div[0] * sub_div[1])) * local_box_size[2];
+    int slice = rank % (sub_div[0] * sub_div[1]);
+    local_box_offset[1] = (slice / sub_div[0]) * local_box_size[1];
+    local_box_offset[0] = (slice % sub_div[0]) * local_box_size[0];
+}
+
+// Create a subarray for read non contiguous data
+MPI_Datatype create_subarray()
+{
+    MPI_Datatype subarray;
+    MPI_Type_create_subarray(3, global_box_size, local_box_size, local_box_offset, MPI_ORDER_FORTRAN, MPI_FLOAT, &subarray);
+    MPI_Type_commit(&subarray);
+    return subarray;
+}
+
+//static void write_one_file(float * buf, int size)
+//{
+//    MPI_Datatype subarray = create_subarray();
+//    MPI_File fh;
+//    MPI_Status status;
+//
+//    MPI_File_open(MPI_COMM_WORLD, file_name, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
+//    MPI_File_set_view(fh, 0, MPI_FLOAT, subarray, "native", MPI_INFO_NULL);
+//    MPI_File_read(fh, buf, size, MPI_FLOAT, &status);
+//    MPI_File_close(&fh);
+//}
+
+
+
